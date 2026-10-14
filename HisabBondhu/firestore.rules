@@ -1,0 +1,60 @@
+rules_version = '2';
+
+// HisabBondhu security rules.
+// Every record lives under users/{uid}/... and can only be touched by that signed-in user.
+// Nothing is ever hard-deleted from the client (corrections are new records or status changes).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // Fields every business document must carry, and may never change hands.
+    function wellFormed(uid, docId) {
+      let d = request.resource.data;
+      return d.ownerUid == uid
+        && d.id is string && d.id == docId
+        && d.updatedAt is int
+        && d.keys().size() <= 60;
+    }
+    function ownerUnchanged() { return request.resource.data.ownerUid == resource.data.ownerUid; }
+
+    // Root user document: only a marker with the owner uid.
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.ownerUid == uid
+        && request.resource.data.keys().size() <= 5;
+      allow delete: if false;
+
+      // ---- editable records (parties, products, expenses, settings)
+      match /{coll}/{docId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid) && coll in ['customers', 'suppliers', 'products', 'expenses', 'settings'] && wellFormed(uid, docId);
+        allow update: if isOwner(uid) && coll in ['customers', 'suppliers', 'products', 'expenses', 'settings']
+          && wellFormed(uid, docId) && ownerUnchanged();
+        allow delete: if false;
+      }
+
+      // ---- invoices and purchases: money fields are frozen, only cancellation may change them
+      match /{coll}/{docId} {
+        allow create: if isOwner(uid) && coll in ['sales', 'purchases'] && wellFormed(uid, docId)
+          && request.resource.data.total is int && request.resource.data.paid is int
+          && request.resource.data.total >= 0 && request.resource.data.paid >= 0
+          && request.resource.data.paid <= request.resource.data.total
+          && request.resource.data.status in ['ACTIVE', 'CANCELLED']
+          && request.resource.data.get('items', []).size() <= 500;
+        allow update: if isOwner(uid) && coll in ['sales', 'purchases'] && wellFormed(uid, docId) && ownerUnchanged()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelReason', 'updatedAt'])
+          && (resource.data.status == 'ACTIVE' || request.resource.data.status == resource.data.status);
+      }
+
+      // ---- append-only ledgers: can be created once; a retry may rewrite identical content only
+      match /{coll}/{docId} {
+        allow create: if isOwner(uid) && coll in ['payments', 'stockMovements', 'returns', 'auditLogs'] && wellFormed(uid, docId);
+        allow update: if isOwner(uid) && coll in ['payments', 'stockMovements', 'returns', 'auditLogs']
+          && request.resource.data == resource.data;
+      }
+    }
+  }
+}
